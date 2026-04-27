@@ -492,16 +492,18 @@ class BinanceExecutionService
     /**
      * Secures atomic position limits structurally bypassing trailing 60ms naked network gaps identically
      */
-    public function updateTrailingBracket(string $symbol, string $side, string $orderId, float $newStopPrice): array
+    public function updateTrailingBracket(string $symbol, string $side, ?string $orderId, float $newStopPrice): array
     {
         // 1. Delete Existing Algo Order gracefully sequentially since algoOrder lacks cancelReplace bounds natively
-        try {
-            $this->dispatchAuthenticatedRequest('/fapi/v1/algoOrder', [
-                'symbol' => $symbol,
-                'algoId' => $orderId 
-            ], 'DELETE');
-        } catch (\Throwable $e) {
-            \Illuminate\Support\Facades\Log::warning("Trailing bracket execution fault natively bypassed: " . $e->getMessage());
+        if ($orderId !== null && $orderId !== '') {
+            try {
+                $this->dispatchAuthenticatedRequest('/fapi/v1/algoOrder', [
+                    'symbol' => $symbol,
+                    'algoId' => $orderId 
+                ], 'DELETE');
+            } catch (\Throwable $e) {
+                \Illuminate\Support\Facades\Log::warning("Trailing bracket execution fault natively bypassed: " . $e->getMessage());
+            }
         }
 
         // 2. Sweep New Algo order seamlessly 

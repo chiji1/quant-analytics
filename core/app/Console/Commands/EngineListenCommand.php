@@ -207,12 +207,17 @@ class EngineListenCommand extends Command
             if ($shouldTrail) {
 
                 try {
-                    $this->executor->updateTrailingBracket(
+                    $response = $this->executor->updateTrailingBracket(
                         $trade->symbol,
                         $closeSide,
                         $trade->stop_loss_order_id,
                         $newStopPrice
                     );
+                    
+                    if (isset($response['orderId'])) {
+                        $trade->update(['stop_loss_order_id' => (string) $response['orderId']]);
+                    }
+
                     \Illuminate\Support\Facades\Log::info("Atomic Trailing Executed correctly identical natively for {$trade->symbol}");
                 } catch (\Throwable $e) {
                     \Illuminate\Support\Facades\Log::warning("Atomic cancelReplace boundary rejection purely due to structural limits: {$e->getMessage()}");
