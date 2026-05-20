@@ -19,8 +19,13 @@ class CascadingPanicShortStrategy implements TradingStrategyInterface
         $side = $marketData['side'];
         $price = (float) $marketData['price'];
         $qty = (float) $marketData['original_quantity'];
+        $tapeVolume = (float) ($marketData['tape_volume'] ?? 0.0);
 
         $liqVolume = $price * $qty;
+
+        if ($liqVolume < 15000.0 || $liqVolume < ($tapeVolume * 2.5)) {
+            return null; // Absolute Institutional Firewall drops Altcoin noise naturally
+        }
 
         if ($side === 'BUY') {
             $depthCache = \Illuminate\Support\Facades\Cache::get('latest_depth_' . $symbol);
@@ -28,20 +33,34 @@ class CascadingPanicShortStrategy implements TradingStrategyInterface
                 return null;
             }
 
-            // Depth Relativity Native Check
+            // Structural Wick Deviation Analysis natively extrapolating array walk
             $summedAskVolume = 0.0;
-            foreach (array_slice($depthCache['asks'], 0, 50) as $ask) {
-                $summedAskVolume += (float) $ask['price'] * (float) $ask['quantity'];
+            $terminalWickPrice = $price;
+            $depthAsks = array_slice($depthCache['asks'], 0, 50);
+
+            foreach ($depthAsks as $ask) {
+                $levelVol = (float) $ask['price'] * (float) $ask['quantity'];
+                $summedAskVolume += $levelVol;
+                if ($summedAskVolume >= $liqVolume) {
+                    $terminalWickPrice = (float) $ask['price'];
+                    break;
+                }
             }
 
-            if ($liqVolume < $summedAskVolume) {
-                return null; // Not practically overwhelming structure natively
+            // Map absolute wipeout boundary seamlessly if liquidation eats the entire 50 levels structurally
+            if ($summedAskVolume < $liqVolume) {
+                $terminalWickPrice = (float) $depthAsks[count($depthAsks) - 1]['price'];
             }
 
-            // Volumetric Scaling limits dynamically natively mapped spanning 2x -> 8x
+            $wickDeviation = (($terminalWickPrice - $price) / $price) * 100;
+            if ($wickDeviation < 1.0) {
+                return null; // Structurally insignificant slippage deviation (Gap mapping aborted inherently)
+            }
+
+            // Volumetric Scaling limits dynamically natively mapped spanning 2x -> 10x
             $ratio = min(5.0, max(1.0, $liqVolume / $summedAskVolume));
             $ratioScale = ($ratio - 1.0) / 4.0;
-            $targetLeverage = (int) round(2 + ($ratioScale * 6));
+            $targetLeverage = min(10, (int) round(2 + ($ratioScale * 8)));
 
             // Retail Risk Profile natively mapped
             $dynamicSL = 0.010 + ($ratioScale * 0.005); // 1.0% to 1.5%

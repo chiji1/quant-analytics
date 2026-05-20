@@ -1,0 +1,481 @@
+diff --git a/.DS_Store b/.DS_Store
+index d87ff59..a0be5fa 100644
+Binary files a/.DS_Store and b/.DS_Store differ
+diff --git a/core/app/Console/Commands/EngineListenCommand.php b/core/app/Console/Commands/EngineListenCommand.php
+index c58ee03..472b2cd 100644
+--- a/core/app/Console/Commands/EngineListenCommand.php
++++ b/core/app/Console/Commands/EngineListenCommand.php
+@@ -150,6 +150,16 @@ private function processPayload(array $payload): void
+             $payload['bids'] = $payload['bids'] ?? $payload['b'];
+             $payload['asks'] = $payload['asks'] ?? $payload['a'];
+             $payload['symbol'] = $payload['symbol'] ?? $payload['s'] ?? 'UNKNOWN';
++            
++            if ($payload['symbol'] === 'BTCUSDT' && isset($payload['velocity_ema'])) {
++                \Illuminate\Support\Facades\Cache::put('system:btc_velocity_ema', (float)$payload['velocity_ema'], 60);
++            }
++        } elseif ($eventType === 'forceOrder') {
++            $payload['symbol'] = $payload['o']['s'] ?? $payload['symbol'] ?? 'UNKNOWN';
++            $payload['side'] = $payload['o']['S'] ?? $payload['side'] ?? 'UNKNOWN';
++            $payload['price'] = $payload['o']['p'] ?? $payload['price'] ?? 0;
++            $payload['original_quantity'] = $payload['o']['q'] ?? $payload['original_quantity'] ?? 0;
++            $payload['tape_volume'] = $payload['tape_volume'] ?? 0.0;
+         }
+ 
+         // Substitute static PHP array bindings natively replacing dynamically executing Laravel class_exists() IO dependencies
+@@ -205,13 +215,27 @@ private function evaluateTrailingSafeguards(): void
+             }
+ 
+             if ($shouldTrail) {
++                // Dynamically retrieve asset-specific tickSize mapping
++                $exchangeInfo = \Illuminate\Support\Facades\Cache::get("exchange_info_{$trade->symbol}");
++                $tickSize = 0.01; // default fallback
++                if ($exchangeInfo && isset($exchangeInfo['filters'])) {
++                    foreach ($exchangeInfo['filters'] as $filter) {
++                        if ($filter['filterType'] === 'PRICE_FILTER') {
++                            $tickSize = (float) $filter['tickSize'];
++                            break;
++                        }
++                    }
++                }
++
++                $stepPrecision = max(0, strlen(substr(strrchr((string) $tickSize, "."), 1)));
++                $sanitizedStopPrice = number_format($newStopPrice, $stepPrecision, '.', '');
+ 
+                 try {
+                     $response = $this->executor->updateTrailingBracket(
+                         $trade->symbol,
+                         $closeSide,
+                         $trade->stop_loss_order_id,
+-                        $newStopPrice
++                        (float) $sanitizedStopPrice
+                     );
+                     
+                     if (isset($response['orderId'])) {
+@@ -220,6 +244,10 @@ private function evaluateTrailingSafeguards(): void
+ 
+                     \Illuminate\Support\Facades\Log::info("Atomic Trailing Executed correctly identical natively for {$trade->symbol}");
+                 } catch (\Throwable $e) {
++                    if (strpos($e->getMessage(), '-4130') !== false || strpos($e->getMessage(), '-2011') !== false) {
++                        \Illuminate\Support\Facades\Log::info("Trailing Mutex skipped: Bracket natively triggered out-of-bounds on Binance. Deferring {$trade->symbol} state management to websocket.");
++                        continue;
++                    }
+                     \Illuminate\Support\Facades\Log::warning("Atomic cancelReplace boundary rejection purely due to structural limits: {$e->getMessage()}");
+                 }
+             }
+diff --git a/core/app/Services/BinanceExecutionService.php b/core/app/Services/BinanceExecutionService.php
+index a1ddfe0..9e2d05f 100644
+--- a/core/app/Services/BinanceExecutionService.php
++++ b/core/app/Services/BinanceExecutionService.php
+@@ -213,6 +213,12 @@ public function dispatchIntelligentBracket(array $signal)
+         $slPercentage = (float) $signal['sl_percentage'];
+         $tpPercentage = (float) $signal['tp_percentage'];
+ 
++        // 0. Conditionally Configure Execution Layer State organically
++        if (isset($signal['target_leverage'])) {
++            $this->setMarginType($symbol, 'CROSSED');
++            $this->setDynamicLeverage($symbol, (int) $signal['target_leverage']);
++        }
++
+         // 1. Universal Collateral Integrity Check
+         $baseAllocation = (float) (Cache::get('system:risk_parameters')['base_allocation_usdt'] ?? 10000.0);
+         $availableMargin = $this->getAvailableCollateral();
+diff --git a/core/app/Strategies/CascadingPanicShortStrategy.php b/core/app/Strategies/CascadingPanicShortStrategy.php
+index 972887b..ab07105 100644
+--- a/core/app/Strategies/CascadingPanicShortStrategy.php
++++ b/core/app/Strategies/CascadingPanicShortStrategy.php
+@@ -19,29 +19,48 @@ public function evaluate(array $marketData): ?array
+         $side = $marketData['side'];
+         $price = (float) $marketData['price'];
+         $qty = (float) $marketData['original_quantity'];
++        $tapeVolume = (float) ($marketData['tape_volume'] ?? 0.0);
+ 
+         $liqVolume = $price * $qty;
+ 
++        if ($liqVolume < 15000.0 || $liqVolume < ($tapeVolume * 2.5)) {
++            return null; // Absolute Institutional Firewall drops Altcoin noise naturally
++        }
++
+         if ($side === 'BUY') {
+             $depthCache = \Illuminate\Support\Facades\Cache::get('latest_depth_' . $symbol);
+             if (!$depthCache || empty($depthCache['asks'])) {
+                 return null;
+             }
+ 
+-            // Depth Relativity Native Check
++            // Structural Wick Deviation Analysis natively extrapolating array walk
+             $summedAskVolume = 0.0;
+-            foreach (array_slice($depthCache['asks'], 0, 50) as $ask) {
+-                $summedAskVolume += (float) $ask['price'] * (float) $ask['quantity'];
++            $terminalWickPrice = $price;
++            $depthAsks = array_slice($depthCache['asks'], 0, 50);
++
++            foreach ($depthAsks as $ask) {
++                $levelVol = (float) $ask['price'] * (float) $ask['quantity'];
++                $summedAskVolume += $levelVol;
++                if ($summedAskVolume >= $liqVolume) {
++                    $terminalWickPrice = (float) $ask['price'];
++                    break;
++                }
++            }
++
++            // Map absolute wipeout boundary seamlessly if liquidation eats the entire 50 levels structurally
++            if ($summedAskVolume < $liqVolume) {
++                $terminalWickPrice = (float) $depthAsks[count($depthAsks) - 1]['price'];
+             }
+ 
+-            if ($liqVolume < $summedAskVolume) {
+-                return null; // Not practically overwhelming structure natively
++            $wickDeviation = (($terminalWickPrice - $price) / $price) * 100;
++            if ($wickDeviation < 1.0) {
++                return null; // Structurally insignificant slippage deviation (Gap mapping aborted inherently)
+             }
+ 
+-            // Volumetric Scaling limits dynamically natively mapped spanning 2x -> 8x
++            // Volumetric Scaling limits dynamically natively mapped spanning 2x -> 10x
+             $ratio = min(5.0, max(1.0, $liqVolume / $summedAskVolume));
+             $ratioScale = ($ratio - 1.0) / 4.0;
+-            $targetLeverage = (int) round(2 + ($ratioScale * 6));
++            $targetLeverage = min(10, (int) round(2 + ($ratioScale * 8)));
+ 
+             // Retail Risk Profile natively mapped
+             $dynamicSL = 0.010 + ($ratioScale * 0.005); // 1.0% to 1.5%
+diff --git a/core/app/Strategies/OrderBookImbalanceStrategy.php b/core/app/Strategies/OrderBookImbalanceStrategy.php
+index 80a0b12..d1f73dc 100644
+--- a/core/app/Strategies/OrderBookImbalanceStrategy.php
++++ b/core/app/Strategies/OrderBookImbalanceStrategy.php
+@@ -22,36 +22,50 @@ public function evaluate(array $marketData): ?array
+         $bestBid = (float) $marketData['bids'][0][0];
+         $bestAsk = (float) $marketData['asks'][0][0];
+ 
+-        if ($bestAsk <= 0) return null;
++        if ($bestAsk <= 0 || $bestBid <= 0) return null;
+ 
+-        // Phase 1: Spread Circuit Breaker completely halting execution during violent evaporation structurally
++        $velocityEma = (float) ($marketData['velocity_ema'] ?? 0.0);
++
++        // Phase 1: Dynamic Spread Circuit Breaker scaling to market surge
+         $spreadPercentage = (($bestAsk - $bestBid) / $bestAsk) * 100;
+-        if ($spreadPercentage > 0.15) {
+-            // \Illuminate\Support\Facades\Log::warning("Spread Circuit Breaker Triggered: Spread is " . number_format($spreadPercentage, 3) . "%. Signal Dropped.");
++        $maxSpread = (abs($velocityEma) > 10.0) ? 0.45 : 0.15;
++        
++        if ($spreadPercentage > $maxSpread) {
+             return null;
+         }
+ 
+-        // Phase 2: Deep 20-Level Institutional Depth Penetration natively
++        // Phase 2: Anti-Spoofing Deep Book Matrix
+         $bids = array_slice($marketData['bids'], 0, 20);
+         $asks = array_slice($marketData['asks'], 0, 20);
+ 
+-        // Extended 20-level Exponential Decay Weighting limits spoof walls.
+-        $decayFactors = [
+-            1.00, 0.95, 0.90, 0.85, 0.80, 0.75, 0.70, 0.65, 0.60, 0.55,
+-            0.50, 0.45, 0.40, 0.35, 0.30, 0.25, 0.20, 0.15, 0.10, 0.05
++        // Inverted Mid-Book Weighting (Ignores Front-Book HFT noise)
++        $rawWeights = [
++            0.1, 0.1, 0.2, 0.2, // Levels 0-3
++            1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, // Levels 4-12
++            0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2 // Levels 13-19
+         ];
+ 
++        $bidsCount = count($bids);
++        if ($bidsCount < 10) return null;
++        $normalizer = 20.0 / $bidsCount; 
++
+         $bidVolume = 0.0;
+         foreach ($bids as $index => $bid) {
++            if (!isset($rawWeights[$index]) || !isset($bid[0]) || !isset($bid[1])) continue;
+             $volume = ((float)$bid[0] * (float)$bid[1]);
+-            $multiplier = $decayFactors[$index] ?? 0.2;
++            $multiplier = $rawWeights[$index] * $normalizer;
+             $bidVolume += ($volume * $multiplier);
+         }
+ 
++        $asksCount = count($asks);
++        if ($asksCount < 10) return null;
++        $normalizerAsk = 20.0 / $asksCount;
++
+         $askVolume = 0.0;
+         foreach ($asks as $index => $ask) {
++            if (!isset($rawWeights[$index]) || !isset($ask[0]) || !isset($ask[1])) continue;
+             $volume = ((float)$ask[0] * (float)$ask[1]);
+-            $multiplier = $decayFactors[$index] ?? 0.2;
++            $multiplier = $rawWeights[$index] * $normalizerAsk;
+             $askVolume += ($volume * $multiplier);
+         }
+ 
+@@ -60,72 +74,73 @@ public function evaluate(array $marketData): ?array
+         $imbalanceRatio = max($bidVolume, $askVolume) / min($bidVolume, $askVolume);
+ 
+         if ($imbalanceRatio < 7.0) {
+-            return null; // Suppresses mathematically structurally insignificant deviations safely
++            return null; 
+         }
+ 
+-        // Phase 3 & 4: Institutional RAM Validation Matrix inherently parsed from Python
++        // Phase 3 & 4: Institutional Volumetric Validity
+         $velocityDelta = (float) ($marketData['velocity_delta'] ?? 0.0);
+-        $tapeVolume = (float) ($marketData['tape_volume'] ?? 0.0);
+ 
+-        // Positive velocity structurally implies physical absorption natively.
+-        // Drops static spoof networks mathematically implicitly.
+-        if ($velocityDelta < 2.0 && $velocityDelta > -2.0) {
+-            return null; 
+-        }
+-
+-        // Tape bounds inherently require $25,000 to physically cross the spread validating intensity natively 
+-        if ($tapeVolume < 25000.0) {
++        // Drop static spoof matrices
++        if (abs($velocityDelta) < 2.0) {
+             return null; 
+         }
+ 
+         $symbol = $marketData['symbol'];
+-        $maxAllocation = (float) (\Illuminate\Support\Facades\Cache::get('system:risk_parameters')['max_trade_allocation_usdt'] ?? 100000.0);
+-        $clampedBase = max(10.0, (float) (\Illuminate\Support\Facades\Cache::get('system:risk_parameters')['base_allocation_usdt'] ?? 10.0));
++        $imbalanceDirection = ($bidVolume > $askVolume) ? 'BUY' : 'SELL';
+ 
+-        // Phase 2: Dynamic Volume Scale Factor & Risk Profile Matrix
++        // BTC Gravity Vector Check & News Decoupling ByPass
++        $btcVelocity = (float) \Illuminate\Support\Facades\Cache::get('system:btc_velocity_ema', 0.0);
++        $isOpposingBtc = ($imbalanceDirection === 'BUY' && $btcVelocity < -2.0) || ($imbalanceDirection === 'SELL' && $btcVelocity > 2.0);
++        
++        if ($isOpposingBtc) {
++            // Tier 1 Dual-Layer Momentum Guard: Pair must be experiencing explosive immediate volume (HFT) AND sustained structural 5-m surges.
++            if (!(abs($velocityDelta) > 10.0 && abs($velocityEma) > 3.0)) { 
++                return null;
++            }
++        }
++
++        // Phase 2: Inverted Risk Profile Matrix (Volatility-Damped Pre-Trade scaling)
+         $ratioScale = min(1.0, ($imbalanceRatio - 7.0) / (14.0 - 7.0)); 
+-        $targetLeverage = (int) round(2 + (3 * $ratioScale));
++        
++        // Target Leverage drops as Confidence increases
++        $targetLeverage = (int) round(5.0 - (3.0 * $ratioScale)); // Scales 5x down to 2x 
+ 
+-        // Retail Risk Calculations (High confidence -> tighter SL, wider TP)
+-        $dynamicSL = 0.006 - ($ratioScale * 0.003); // Scales from 0.006 to 0.003
+-        $dynamicTP = 0.010 + ($ratioScale * 0.005); // Scales from 0.010 to 0.015
++        // Stop Loss widens as Confidence increases
++        $dynamicSL = 0.006 + ($ratioScale * 0.006); // Scales 0.006 up to 0.012
++        $dynamicTP = 0.010 + ($ratioScale * 0.005); // Scales 0.010 up to 0.015
++
++        $maxAllocation = (float) (\Illuminate\Support\Facades\Cache::get('system:risk_parameters')['max_trade_allocation_usdt'] ?? 100000.0);
++        $clampedBase = max(10.0, (float) (\Illuminate\Support\Facades\Cache::get('system:risk_parameters')['base_allocation_usdt'] ?? 10.0));
+ 
+         $executor = app(\App\Services\BinanceExecutionService::class);
+         $minNotional = $executor->getMinNotional($symbol);
+         
+-        // Phase 3: The Minimum Notional Enforcer & Retail Safety Guard
++        // Phase 3: The Minimum Notional Base-Allocation Bump Rescue
+         $worstCaseDrop = max($dynamicSL, $dynamicTP);
+         $dynamicPaddingMultiplier = (1.0 / (1.0 - $worstCaseDrop)) * 1.05; 
+         
+-        $notionalEnforcerLeverage = (int) ceil(($minNotional * $dynamicPaddingMultiplier) / $clampedBase);
+-
+-        if ($notionalEnforcerLeverage > 20) {
+-            return null; // Hardware retail safety constraint: Leverage exceeds Altcoin capacities natively.
++        $requiredNotional = $minNotional * $dynamicPaddingMultiplier;
++        $organicNotional = $clampedBase * $targetLeverage;
++        
++        if ($organicNotional < $requiredNotional) {
++            // Bounce the unleveraged base limit natively up
++            $bumpedBase = $requiredNotional / $targetLeverage;
++            if ($bumpedBase > $maxAllocation) {
++                return null; 
++            }
++            $clampedBase = $bumpedBase;
+         }
+ 
+-        $targetLeverage = max($targetLeverage, $notionalEnforcerLeverage);
+         $scaledAllocation = min($maxAllocation, $clampedBase * $targetLeverage);
+ 
+-        // Safely push API execution modifiers securely before emitting brackets natively
+-        $executor->setMarginType($symbol, 'CROSSED');
+-        $executor->setDynamicLeverage($symbol, $targetLeverage);
+-
+-        if ($bidVolume > $askVolume) {
+-            return [
+-                'symbol' => $symbol,
+-                'side' => 'BUY',
+-                'usdt_allocation' => $scaledAllocation,
+-                'sl_percentage' => $dynamicSL,
+-                'tp_percentage' => $dynamicTP,
+-            ];
+-        } else {
+-            return [
+-                'symbol' => $symbol,
+-                'side' => 'SELL',
+-                'usdt_allocation' => $scaledAllocation,
+-                'sl_percentage' => $dynamicSL,
+-                'tp_percentage' => $dynamicTP,
+-            ];
+-        }
++        return [
++            'symbol' => $symbol,
++            'side' => $imbalanceDirection,
++            'usdt_allocation' => $scaledAllocation,
++            'sl_percentage' => $dynamicSL,
++            'tp_percentage' => $dynamicTP,
++            'ioc_price' => ($imbalanceDirection === 'BUY') ? $bestAsk : $bestBid,
++            'target_leverage' => $targetLeverage
++        ];
+     }
+ }
+diff --git a/core/resources/js/stores/useTradingStore.ts b/core/resources/js/stores/useTradingStore.ts
+index 6700d94..141839f 100644
+--- a/core/resources/js/stores/useTradingStore.ts
++++ b/core/resources/js/stores/useTradingStore.ts
+@@ -54,6 +54,8 @@ export interface TradingStoreState {
+     setRiskParameters: (params: RiskParameters) => void;
+     fetchRiskParameters: () => Promise<void>;
+     hydrateOrderBook: (symbol: string) => Promise<void>;
++    setTrades: (trades: TradeExecution[]) => void;
++    fetchHistoricalTrades: () => Promise<void>;
+ 
+     displaySymbol: string | null;
+     setDisplaySymbol: (symbol: string) => void;
+diff --git a/ingestion/app/models/__pycache__/payloads.cpython-310.pyc b/ingestion/app/models/__pycache__/payloads.cpython-310.pyc
+index 932ba84..23c1101 100644
+Binary files a/ingestion/app/models/__pycache__/payloads.cpython-310.pyc and b/ingestion/app/models/__pycache__/payloads.cpython-310.pyc differ
+diff --git a/ingestion/app/models/payloads.py b/ingestion/app/models/payloads.py
+index e7a5215..8865ee1 100644
+--- a/ingestion/app/models/payloads.py
++++ b/ingestion/app/models/payloads.py
+@@ -18,6 +18,7 @@ class DepthUpdatePayload(BaseModel):
+     bids: List[Tuple[str, str]] = Field(alias="b")
+     asks: List[Tuple[str, str]] = Field(alias="a")
+     velocity_delta: float = Field(default=0.0)
++    velocity_ema: float = Field(default=0.0)
+     tape_volume: float = Field(default=0.0)
+ 
+ 
+@@ -49,6 +50,7 @@ class LiquidationPayload(BaseModel):
+     event_type: str = Field(alias="e")
+     event_time: int = Field(alias="E")
+     order: LiquidationOrderDetails = Field(alias="o")
++    tape_volume: float = Field(default=0.0)
+ 
+ 
+ class SystemCommand(BaseModel):
+diff --git a/ingestion/app/providers/__pycache__/redis_client.cpython-310.pyc b/ingestion/app/providers/__pycache__/redis_client.cpython-310.pyc
+index cc11c4c..d83c4bf 100644
+Binary files a/ingestion/app/providers/__pycache__/redis_client.cpython-310.pyc and b/ingestion/app/providers/__pycache__/redis_client.cpython-310.pyc differ
+diff --git a/ingestion/app/services/__pycache__/binance_ws.cpython-310.pyc b/ingestion/app/services/__pycache__/binance_ws.cpython-310.pyc
+index f12c7c0..85cbd1e 100644
+Binary files a/ingestion/app/services/__pycache__/binance_ws.cpython-310.pyc and b/ingestion/app/services/__pycache__/binance_ws.cpython-310.pyc differ
+diff --git a/ingestion/app/services/__pycache__/news_poller.cpython-310.pyc b/ingestion/app/services/__pycache__/news_poller.cpython-310.pyc
+index 54c05dd..3d4eb95 100644
+Binary files a/ingestion/app/services/__pycache__/news_poller.cpython-310.pyc and b/ingestion/app/services/__pycache__/news_poller.cpython-310.pyc differ
+diff --git a/ingestion/app/services/__pycache__/ollama_worker.cpython-310.pyc b/ingestion/app/services/__pycache__/ollama_worker.cpython-310.pyc
+index fe5d378..14fdf74 100644
+Binary files a/ingestion/app/services/__pycache__/ollama_worker.cpython-310.pyc and b/ingestion/app/services/__pycache__/ollama_worker.cpython-310.pyc differ
+diff --git a/ingestion/app/services/binance_ws.py b/ingestion/app/services/binance_ws.py
+index b447f43..3426094 100644
+--- a/ingestion/app/services/binance_ws.py
++++ b/ingestion/app/services/binance_ws.py
+@@ -4,6 +4,7 @@ import ssl
+ import certifi
+ import time
+ from typing import Optional
++from collections import deque
+ 
+ try:
+     import orjson as json
+@@ -132,27 +133,55 @@ class BinanceDataStreamer:
+ 
+             current_time = time.time()
+ 
+-            # Phase 4: Tape Validation mapping (Appends Tape volume structurally)
+-            data["tape_volume"] = self.tape_cache.get(symbol, {}).get("vol", 0.0)
++            # Phase 4: Tape Validation Mapping (Prune stale 5m rolling window)
++            if symbol in self.tape_cache:
++                events = self.tape_cache[symbol]["events"]
++                while events and current_time - events[0][1] > 300.0: # 5-minute rolling
++                    popped_vol, _ = events.popleft()
++                    self.tape_cache[symbol]["sum"] -= popped_vol
++                
++                # Floating point drift correction bounds
++                if self.tape_cache[symbol]["sum"] < 0:
++                    self.tape_cache[symbol]["sum"] = 0.0
++                    
++                data["tape_volume"] = self.tape_cache[symbol]["sum"]
++            else:
++                data["tape_volume"] = 0.0
+ 
+-            # Phase 3: Order Book Velocity extraction
++            # Phase 3: Order Book Velocity & 5-minute EMA extraction
+             bids = data.get("b", data.get("bids", []))
+             bid_vol = sum(float(b[0]) * float(b[1]) for b in bids[:20])
+ 
+             velocity_delta = 0.0
++            velocity_ema = 0.0
+ 
+             if symbol not in self.state_cache:
+-                self.state_cache[symbol] = {"bid_vol": bid_vol, "timestamp": current_time}
++                self.state_cache[symbol] = {"bid_vol": bid_vol, "timestamp": current_time, "ema": 0.0, "vel": 0.0}
+             else:
+                 delta_time = current_time - self.state_cache[symbol]["timestamp"]
+-                # 3-Second rolling execution bounded purely in RAM mathematically
++                # 3-Second snapshots feeding into 5-minute EMA bounds inherently
+                 if delta_time >= 3.0:
+                     past_bid = self.state_cache[symbol]["bid_vol"]
+                     if past_bid > 0:
+                         velocity_delta = ((bid_vol - past_bid) / past_bid) * 100
+-                    self.state_cache[symbol] = {"bid_vol": bid_vol, "timestamp": current_time}
++                    
++                    # 5-minute EMA mapped across 3-second intervals = 100 periods roughly (2 / (100 + 1)) = ~0.0198
++                    alpha = 0.0198
++                    old_ema = self.state_cache[symbol].get("ema", 0.0)
++                    velocity_ema = (velocity_delta * alpha) + (old_ema * (1.0 - alpha))
++                    
++                    self.state_cache[symbol] = {
++                        "bid_vol": bid_vol, 
++                        "timestamp": current_time, 
++                        "ema": velocity_ema, 
++                        "vel": velocity_delta
++                    }
++                else:
++                    velocity_delta = self.state_cache[symbol].get("vel", 0.0)
++                    velocity_ema = self.state_cache[symbol].get("ema", 0.0)
+ 
+             data["velocity_delta"] = velocity_delta
++            data["velocity_ema"] = velocity_ema
+ 
+         except Exception as e:
+             logger.error(f"Alpha execution delta math natively failed: {e}")
+@@ -169,14 +198,13 @@ class BinanceDataStreamer:
+             if event_type == "aggTrade":
+                 symbol = data.get("s")
+                 trade_volume = float(data.get("p", 0)) * float(data.get("q", 0))
+-                # Only sum buyer market maker trades (which means Market Buys crossing Ask books) inherently
+                 is_buyer_maker = data.get("m", False)
+                 if not is_buyer_maker:
+-                    current_vol = self.tape_cache.get(symbol, {}).get("vol", 0.0)
+-                    # Simple RAM rolling sum structure natively 
+-                    if current_vol > 500000:  # Prevent RAM sum overflows artificially
+-                        current_vol = 0.0
+-                    self.tape_cache[symbol] = {"vol": current_vol + trade_volume, "ts": time.time()}
++                    if symbol not in self.tape_cache:
++                        self.tape_cache[symbol] = {"sum": 0.0, "events": deque()}
++                    
++                    self.tape_cache[symbol]["events"].append((trade_volume, time.time()))
++                    self.tape_cache[symbol]["sum"] += trade_volume
+                 return
+ 
+             # Partial snapshots natively drop "e", but universally retain "u", "b", "asks", "bids"
+@@ -187,6 +215,9 @@ class BinanceDataStreamer:
+                 self.depth_buffer.append(payload)
+                 
+             elif event_type == "forceOrder":
++                symbol = data.get("o", {}).get("s")
++                if symbol:
++                    data["tape_volume"] = self.tape_cache.get(symbol, {}).get("sum", 0.0)
+                 payload = LiquidationPayload.model_validate(data)
+                 
+                 # Liquidations are maximum-priority events; bypass buffers entirely directly into Stream
+diff --git a/ingestion/config/__pycache__/settings.cpython-310.pyc b/ingestion/config/__pycache__/settings.cpython-310.pyc
+index 6cb36b1..8f1cdaa 100644
+Binary files a/ingestion/config/__pycache__/settings.cpython-310.pyc and b/ingestion/config/__pycache__/settings.cpython-310.pyc differ

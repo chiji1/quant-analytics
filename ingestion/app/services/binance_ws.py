@@ -4,6 +4,7 @@ import ssl
 import certifi
 import time
 from typing import Optional
+from collections import deque
 
 try:
     import orjson as json
@@ -132,27 +133,55 @@ class BinanceDataStreamer:
 
             current_time = time.time()
 
-            # Phase 4: Tape Validation mapping (Appends Tape volume structurally)
-            data["tape_volume"] = self.tape_cache.get(symbol, {}).get("vol", 0.0)
+            # Phase 4: Tape Validation Mapping (Prune stale 5m rolling window)
+            if symbol in self.tape_cache:
+                events = self.tape_cache[symbol]["events"]
+                while events and current_time - events[0][1] > 300.0: # 5-minute rolling
+                    popped_vol, _ = events.popleft()
+                    self.tape_cache[symbol]["sum"] -= popped_vol
+                
+                # Floating point drift correction bounds
+                if self.tape_cache[symbol]["sum"] < 0:
+                    self.tape_cache[symbol]["sum"] = 0.0
+                    
+                data["tape_volume"] = self.tape_cache[symbol]["sum"]
+            else:
+                data["tape_volume"] = 0.0
 
-            # Phase 3: Order Book Velocity extraction
+            # Phase 3: Order Book Velocity & 5-minute EMA extraction
             bids = data.get("b", data.get("bids", []))
             bid_vol = sum(float(b[0]) * float(b[1]) for b in bids[:20])
 
             velocity_delta = 0.0
+            velocity_ema = 0.0
 
             if symbol not in self.state_cache:
-                self.state_cache[symbol] = {"bid_vol": bid_vol, "timestamp": current_time}
+                self.state_cache[symbol] = {"bid_vol": bid_vol, "timestamp": current_time, "ema": 0.0, "vel": 0.0}
             else:
                 delta_time = current_time - self.state_cache[symbol]["timestamp"]
-                # 3-Second rolling execution bounded purely in RAM mathematically
+                # 3-Second snapshots feeding into 5-minute EMA bounds inherently
                 if delta_time >= 3.0:
                     past_bid = self.state_cache[symbol]["bid_vol"]
                     if past_bid > 0:
                         velocity_delta = ((bid_vol - past_bid) / past_bid) * 100
-                    self.state_cache[symbol] = {"bid_vol": bid_vol, "timestamp": current_time}
+                    
+                    # 5-minute EMA mapped across 3-second intervals = 100 periods roughly (2 / (100 + 1)) = ~0.0198
+                    alpha = 0.0198
+                    old_ema = self.state_cache[symbol].get("ema", 0.0)
+                    velocity_ema = (velocity_delta * alpha) + (old_ema * (1.0 - alpha))
+                    
+                    self.state_cache[symbol] = {
+                        "bid_vol": bid_vol, 
+                        "timestamp": current_time, 
+                        "ema": velocity_ema, 
+                        "vel": velocity_delta
+                    }
+                else:
+                    velocity_delta = self.state_cache[symbol].get("vel", 0.0)
+                    velocity_ema = self.state_cache[symbol].get("ema", 0.0)
 
             data["velocity_delta"] = velocity_delta
+            data["velocity_ema"] = velocity_ema
 
         except Exception as e:
             logger.error(f"Alpha execution delta math natively failed: {e}")
@@ -169,14 +198,13 @@ class BinanceDataStreamer:
             if event_type == "aggTrade":
                 symbol = data.get("s")
                 trade_volume = float(data.get("p", 0)) * float(data.get("q", 0))
-                # Only sum buyer market maker trades (which means Market Buys crossing Ask books) inherently
                 is_buyer_maker = data.get("m", False)
                 if not is_buyer_maker:
-                    current_vol = self.tape_cache.get(symbol, {}).get("vol", 0.0)
-                    # Simple RAM rolling sum structure natively 
-                    if current_vol > 500000:  # Prevent RAM sum overflows artificially
-                        current_vol = 0.0
-                    self.tape_cache[symbol] = {"vol": current_vol + trade_volume, "ts": time.time()}
+                    if symbol not in self.tape_cache:
+                        self.tape_cache[symbol] = {"sum": 0.0, "events": deque()}
+                    
+                    self.tape_cache[symbol]["events"].append((trade_volume, time.time()))
+                    self.tape_cache[symbol]["sum"] += trade_volume
                 return
 
             # Partial snapshots natively drop "e", but universally retain "u", "b", "asks", "bids"
@@ -187,6 +215,9 @@ class BinanceDataStreamer:
                 self.depth_buffer.append(payload)
                 
             elif event_type == "forceOrder":
+                symbol = data.get("o", {}).get("s")
+                if symbol:
+                    data["tape_volume"] = self.tape_cache.get(symbol, {}).get("sum", 0.0)
                 payload = LiquidationPayload.model_validate(data)
                 
                 # Liquidations are maximum-priority events; bypass buffers entirely directly into Stream

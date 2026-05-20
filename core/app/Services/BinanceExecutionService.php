@@ -213,6 +213,12 @@ class BinanceExecutionService
         $slPercentage = (float) $signal['sl_percentage'];
         $tpPercentage = (float) $signal['tp_percentage'];
 
+        // 0. Conditionally Configure Execution Layer State organically
+        if (isset($signal['target_leverage'])) {
+            $this->setMarginType($symbol, 'CROSSED');
+            $this->setDynamicLeverage($symbol, (int) $signal['target_leverage']);
+        }
+
         // 1. Universal Collateral Integrity Check
         $baseAllocation = (float) (Cache::get('system:risk_parameters')['base_allocation_usdt'] ?? 10000.0);
         $availableMargin = $this->getAvailableCollateral();

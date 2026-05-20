@@ -22,36 +22,50 @@ class OrderBookImbalanceStrategy implements TradingStrategyInterface
         $bestBid = (float) $marketData['bids'][0][0];
         $bestAsk = (float) $marketData['asks'][0][0];
 
-        if ($bestAsk <= 0) return null;
+        if ($bestAsk <= 0 || $bestBid <= 0) return null;
 
-        // Phase 1: Spread Circuit Breaker completely halting execution during violent evaporation structurally
+        $velocityEma = (float) ($marketData['velocity_ema'] ?? 0.0);
+
+        // Phase 1: Dynamic Spread Circuit Breaker scaling to market surge
         $spreadPercentage = (($bestAsk - $bestBid) / $bestAsk) * 100;
-        if ($spreadPercentage > 0.15) {
-            // \Illuminate\Support\Facades\Log::warning("Spread Circuit Breaker Triggered: Spread is " . number_format($spreadPercentage, 3) . "%. Signal Dropped.");
+        $maxSpread = (abs($velocityEma) > 10.0) ? 0.45 : 0.15;
+        
+        if ($spreadPercentage > $maxSpread) {
             return null;
         }
 
-        // Phase 2: Deep 20-Level Institutional Depth Penetration natively
+        // Phase 2: Anti-Spoofing Deep Book Matrix
         $bids = array_slice($marketData['bids'], 0, 20);
         $asks = array_slice($marketData['asks'], 0, 20);
 
-        // Extended 20-level Exponential Decay Weighting limits spoof walls.
-        $decayFactors = [
-            1.00, 0.95, 0.90, 0.85, 0.80, 0.75, 0.70, 0.65, 0.60, 0.55,
-            0.50, 0.45, 0.40, 0.35, 0.30, 0.25, 0.20, 0.15, 0.10, 0.05
+        // Inverted Mid-Book Weighting (Ignores Front-Book HFT noise)
+        $rawWeights = [
+            0.1, 0.1, 0.2, 0.2, // Levels 0-3
+            1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, // Levels 4-12
+            0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2 // Levels 13-19
         ];
+
+        $bidsCount = count($bids);
+        if ($bidsCount < 10) return null;
+        $normalizer = 20.0 / $bidsCount; 
 
         $bidVolume = 0.0;
         foreach ($bids as $index => $bid) {
+            if (!isset($rawWeights[$index]) || !isset($bid[0]) || !isset($bid[1])) continue;
             $volume = ((float)$bid[0] * (float)$bid[1]);
-            $multiplier = $decayFactors[$index] ?? 0.2;
+            $multiplier = $rawWeights[$index] * $normalizer;
             $bidVolume += ($volume * $multiplier);
         }
 
+        $asksCount = count($asks);
+        if ($asksCount < 10) return null;
+        $normalizerAsk = 20.0 / $asksCount;
+
         $askVolume = 0.0;
         foreach ($asks as $index => $ask) {
+            if (!isset($rawWeights[$index]) || !isset($ask[0]) || !isset($ask[1])) continue;
             $volume = ((float)$ask[0] * (float)$ask[1]);
-            $multiplier = $decayFactors[$index] ?? 0.2;
+            $multiplier = $rawWeights[$index] * $normalizerAsk;
             $askVolume += ($volume * $multiplier);
         }
 
@@ -60,72 +74,73 @@ class OrderBookImbalanceStrategy implements TradingStrategyInterface
         $imbalanceRatio = max($bidVolume, $askVolume) / min($bidVolume, $askVolume);
 
         if ($imbalanceRatio < 7.0) {
-            return null; // Suppresses mathematically structurally insignificant deviations safely
-        }
-
-        // Phase 3 & 4: Institutional RAM Validation Matrix inherently parsed from Python
-        $velocityDelta = (float) ($marketData['velocity_delta'] ?? 0.0);
-        $tapeVolume = (float) ($marketData['tape_volume'] ?? 0.0);
-
-        // Positive velocity structurally implies physical absorption natively.
-        // Drops static spoof networks mathematically implicitly.
-        if ($velocityDelta < 2.0 && $velocityDelta > -2.0) {
             return null; 
         }
 
-        // Tape bounds inherently require $25,000 to physically cross the spread validating intensity natively 
-        if ($tapeVolume < 25000.0) {
+        // Phase 3 & 4: Institutional Volumetric Validity
+        $velocityDelta = (float) ($marketData['velocity_delta'] ?? 0.0);
+
+        // Drop static spoof matrices
+        if (abs($velocityDelta) < 2.0) {
             return null; 
         }
 
         $symbol = $marketData['symbol'];
+        $imbalanceDirection = ($bidVolume > $askVolume) ? 'BUY' : 'SELL';
+
+        // BTC Gravity Vector Check & News Decoupling ByPass
+        $btcVelocity = (float) \Illuminate\Support\Facades\Cache::get('system:btc_velocity_ema', 0.0);
+        $isOpposingBtc = ($imbalanceDirection === 'BUY' && $btcVelocity < -2.0) || ($imbalanceDirection === 'SELL' && $btcVelocity > 2.0);
+        
+        if ($isOpposingBtc) {
+            // Tier 1 Dual-Layer Momentum Guard: Pair must be experiencing explosive immediate volume (HFT) AND sustained structural 5-m surges.
+            if (!(abs($velocityDelta) > 10.0 && abs($velocityEma) > 3.0)) { 
+                return null;
+            }
+        }
+
+        // Phase 2: Inverted Risk Profile Matrix (Volatility-Damped Pre-Trade scaling)
+        $ratioScale = min(1.0, ($imbalanceRatio - 7.0) / (14.0 - 7.0)); 
+        
+        // Target Leverage drops as Confidence increases
+        $targetLeverage = (int) round(5.0 - (3.0 * $ratioScale)); // Scales 5x down to 2x 
+
+        // Stop Loss widens as Confidence increases
+        $dynamicSL = 0.006 + ($ratioScale * 0.006); // Scales 0.006 up to 0.012
+        $dynamicTP = 0.010 + ($ratioScale * 0.005); // Scales 0.010 up to 0.015
+
         $maxAllocation = (float) (\Illuminate\Support\Facades\Cache::get('system:risk_parameters')['max_trade_allocation_usdt'] ?? 100000.0);
         $clampedBase = max(10.0, (float) (\Illuminate\Support\Facades\Cache::get('system:risk_parameters')['base_allocation_usdt'] ?? 10.0));
-
-        // Phase 2: Dynamic Volume Scale Factor & Risk Profile Matrix
-        $ratioScale = min(1.0, ($imbalanceRatio - 7.0) / (14.0 - 7.0)); 
-        $targetLeverage = (int) round(2 + (3 * $ratioScale));
-
-        // Retail Risk Calculations (High confidence -> tighter SL, wider TP)
-        $dynamicSL = 0.006 - ($ratioScale * 0.003); // Scales from 0.006 to 0.003
-        $dynamicTP = 0.010 + ($ratioScale * 0.005); // Scales from 0.010 to 0.015
 
         $executor = app(\App\Services\BinanceExecutionService::class);
         $minNotional = $executor->getMinNotional($symbol);
         
-        // Phase 3: The Minimum Notional Enforcer & Retail Safety Guard
+        // Phase 3: The Minimum Notional Base-Allocation Bump Rescue
         $worstCaseDrop = max($dynamicSL, $dynamicTP);
         $dynamicPaddingMultiplier = (1.0 / (1.0 - $worstCaseDrop)) * 1.05; 
         
-        $notionalEnforcerLeverage = (int) ceil(($minNotional * $dynamicPaddingMultiplier) / $clampedBase);
-
-        if ($notionalEnforcerLeverage > 20) {
-            return null; // Hardware retail safety constraint: Leverage exceeds Altcoin capacities natively.
+        $requiredNotional = $minNotional * $dynamicPaddingMultiplier;
+        $organicNotional = $clampedBase * $targetLeverage;
+        
+        if ($organicNotional < $requiredNotional) {
+            // Bounce the unleveraged base limit natively up
+            $bumpedBase = $requiredNotional / $targetLeverage;
+            if ($bumpedBase > $maxAllocation) {
+                return null; 
+            }
+            $clampedBase = $bumpedBase;
         }
 
-        $targetLeverage = max($targetLeverage, $notionalEnforcerLeverage);
         $scaledAllocation = min($maxAllocation, $clampedBase * $targetLeverage);
 
-        // Safely push API execution modifiers securely before emitting brackets natively
-        $executor->setMarginType($symbol, 'CROSSED');
-        $executor->setDynamicLeverage($symbol, $targetLeverage);
-
-        if ($bidVolume > $askVolume) {
-            return [
-                'symbol' => $symbol,
-                'side' => 'BUY',
-                'usdt_allocation' => $scaledAllocation,
-                'sl_percentage' => $dynamicSL,
-                'tp_percentage' => $dynamicTP,
-            ];
-        } else {
-            return [
-                'symbol' => $symbol,
-                'side' => 'SELL',
-                'usdt_allocation' => $scaledAllocation,
-                'sl_percentage' => $dynamicSL,
-                'tp_percentage' => $dynamicTP,
-            ];
-        }
+        return [
+            'symbol' => $symbol,
+            'side' => $imbalanceDirection,
+            'usdt_allocation' => $scaledAllocation,
+            'sl_percentage' => $dynamicSL,
+            'tp_percentage' => $dynamicTP,
+            'ioc_price' => ($imbalanceDirection === 'BUY') ? $bestAsk : $bestBid,
+            'target_leverage' => $targetLeverage
+        ];
     }
 }

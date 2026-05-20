@@ -18,6 +18,7 @@ class DepthUpdatePayload(BaseModel):
     bids: List[Tuple[str, str]] = Field(alias="b")
     asks: List[Tuple[str, str]] = Field(alias="a")
     velocity_delta: float = Field(default=0.0)
+    velocity_ema: float = Field(default=0.0)
     tape_volume: float = Field(default=0.0)
 
 
@@ -49,6 +50,7 @@ class LiquidationPayload(BaseModel):
     event_type: str = Field(alias="e")
     event_time: int = Field(alias="E")
     order: LiquidationOrderDetails = Field(alias="o")
+    tape_volume: float = Field(default=0.0)
 
 
 class SystemCommand(BaseModel):

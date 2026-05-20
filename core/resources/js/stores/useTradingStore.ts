@@ -54,6 +54,8 @@ export interface TradingStoreState {
     setRiskParameters: (params: RiskParameters) => void;
     fetchRiskParameters: () => Promise<void>;
     hydrateOrderBook: (symbol: string) => Promise<void>;
+    setTrades: (trades: TradeExecution[]) => void;
+    fetchHistoricalTrades: () => Promise<void>;
 
     displaySymbol: string | null;
     setDisplaySymbol: (symbol: string) => void;

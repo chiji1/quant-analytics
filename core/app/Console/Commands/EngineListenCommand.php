@@ -150,6 +150,16 @@ class EngineListenCommand extends Command
             $payload['bids'] = $payload['bids'] ?? $payload['b'];
             $payload['asks'] = $payload['asks'] ?? $payload['a'];
             $payload['symbol'] = $payload['symbol'] ?? $payload['s'] ?? 'UNKNOWN';
+            
+            if ($payload['symbol'] === 'BTCUSDT' && isset($payload['velocity_ema'])) {
+                \Illuminate\Support\Facades\Cache::put('system:btc_velocity_ema', (float)$payload['velocity_ema'], 60);
+            }
+        } elseif ($eventType === 'forceOrder') {
+            $payload['symbol'] = $payload['o']['s'] ?? $payload['symbol'] ?? 'UNKNOWN';
+            $payload['side'] = $payload['o']['S'] ?? $payload['side'] ?? 'UNKNOWN';
+            $payload['price'] = $payload['o']['p'] ?? $payload['price'] ?? 0;
+            $payload['original_quantity'] = $payload['o']['q'] ?? $payload['original_quantity'] ?? 0;
+            $payload['tape_volume'] = $payload['tape_volume'] ?? 0.0;
         }
 
         // Substitute static PHP array bindings natively replacing dynamically executing Laravel class_exists() IO dependencies
@@ -205,13 +215,27 @@ class EngineListenCommand extends Command
             }
 
             if ($shouldTrail) {
+                // Dynamically retrieve asset-specific tickSize mapping
+                $exchangeInfo = \Illuminate\Support\Facades\Cache::get("exchange_info_{$trade->symbol}");
+                $tickSize = 0.01; // default fallback
+                if ($exchangeInfo && isset($exchangeInfo['filters'])) {
+                    foreach ($exchangeInfo['filters'] as $filter) {
+                        if ($filter['filterType'] === 'PRICE_FILTER') {
+                            $tickSize = (float) $filter['tickSize'];
+                            break;
+                        }
+                    }
+                }
+
+                $stepPrecision = max(0, strlen(substr(strrchr((string) $tickSize, "."), 1)));
+                $sanitizedStopPrice = number_format($newStopPrice, $stepPrecision, '.', '');
 
                 try {
                     $response = $this->executor->updateTrailingBracket(
                         $trade->symbol,
                         $closeSide,
                         $trade->stop_loss_order_id,
-                        $newStopPrice
+                        (float) $sanitizedStopPrice
                     );
                     
                     if (isset($response['orderId'])) {
@@ -220,6 +244,10 @@ class EngineListenCommand extends Command
 
                     \Illuminate\Support\Facades\Log::info("Atomic Trailing Executed correctly identical natively for {$trade->symbol}");
                 } catch (\Throwable $e) {
+                    if (strpos($e->getMessage(), '-4130') !== false || strpos($e->getMessage(), '-2011') !== false) {
+                        \Illuminate\Support\Facades\Log::info("Trailing Mutex skipped: Bracket natively triggered out-of-bounds on Binance. Deferring {$trade->symbol} state management to websocket.");
+                        continue;
+                    }
                     \Illuminate\Support\Facades\Log::warning("Atomic cancelReplace boundary rejection purely due to structural limits: {$e->getMessage()}");
                 }
             }
